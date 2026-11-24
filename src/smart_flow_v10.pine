@@ -1,0 +1,1365 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Smart Flow
+//
+// Smart Flow v10 - Liquidity Engine (legacy release)
+// Published as-is for reference. The trading logic is unchanged from the original v10 build.
+// A full audit found 13 logic issues in this version; all are fixed in v11:
+// https://github.com/sergeyrokossovsky-rgb/smart-flow
+//@version=6
+indicator(
+     "Smart Flow v10 - Liquidity Engine (legacy)"
+    ,"Smart Flow v10"
+    ,overlay=true
+    ,max_boxes_count=500
+    ,max_labels_count=500
+    ,max_lines_count=500
+    ,max_bars_back=2000
+)
+
+// ──────────────────────────────────────────────────────
+// 1️⃣ COLOR PALETTE
+// ──────────────────────────────────────────────────────
+C_LONG      = color.rgb(0, 200, 150)
+C_SHORT     = color.rgb(255, 77, 79)
+C_NEUTRAL   = color.rgb(58, 125, 255)
+C_PANEL     = color.rgb(17, 24, 39)
+C_TEXT_MAIN = color.white
+C_TEXT_DIM  = color.new(color.white, 50)
+C_VWAP       = color.rgb(100, 180, 255)
+C_VOL_LEVEL  = color.rgb(245, 166, 35)
+C_SWEEP_LVL  = color.rgb(168, 85, 247)
+C_FVG_BULL   = color.rgb(34, 211, 238)
+C_FVG_BEAR   = color.rgb(251, 146, 60)
+C_BSL        = color.rgb(242, 54, 69)
+C_SSL        = color.rgb(8, 153, 129)
+C_GRADE_AP   = color.rgb(0, 255, 180)
+C_GRADE_A    = color.rgb(0, 200, 150)
+C_GRADE_B    = color.rgb(250, 204, 21)
+C_GRADE_C    = color.rgb(255, 140, 0)
+C_MACRO      = color.rgb(168, 85, 247)
+C_LOCAL      = color.rgb(59, 130, 246)
+C_MICRO      = color.rgb(100, 180, 255)
+C_FALSE_SWEEP = color.rgb(255, 165, 0)
+
+// ──────────────────────────────────────────────────────
+// 2️⃣ SETTINGS
+// ──────────────────────────────────────────────────────
+
+// — LIQUIDITY PROFILER V10 —
+grp_liq = "Liquidity Profiler"
+enable_liq_zones   = input.bool(true, "Enable Liquidity Zones", group=grp_liq, tooltip="Draw BSL/SSL zones on chart. Disable to hide all liquidity visuals.")
+enable_zone_hierarchy = input.bool(true, "Zone Hierarchy (Macro / Local / Micro)", group=grp_liq,
+     tooltip="Creates zones at 3 pivot levels. Macro = structural, Local = intraday, Micro = execution.")
+liq_pivot_local   = input.int(15, "Local Pivot Left Bars", group=grp_liq, minval=2, maxval=50, tooltip="Left-side lookback for local pivot detection. Higher = fewer but stronger zones.")
+liq_pivot_macro   = input.int(40, "Macro Pivot Left Bars", group=grp_liq, minval=10, maxval=100, tooltip="Left-side lookback for macro pivot detection. Higher = structural zones only.")
+liq_pivot_micro   = input.int(5,  "Micro Pivot Left Bars", group=grp_liq, minval=2, maxval=15, tooltip="Left-side lookback for micro pivot detection. Lower = fast execution zones.")
+liq_pivot_right   = input.int(3, "Pivot Right Bars (Delay)", group=grp_liq, minval=1, maxval=10, tooltip="Right-side confirmation delay. Lower = faster zone creation but more false pivots.")
+max_liq_zones     = input.int(12, "Max Zones per Type / Level", group=grp_liq, minval=1, maxval=40, tooltip="Oldest zones are removed when limit is reached.")
+show_liq_swept    = input.bool(true, "Show Swept Zones", group=grp_liq, tooltip="Keep showing zones after they are swept (dashed style). Disable to hide swept zones.")
+filter_liq_overlap = input.bool(true, "Filter Same-Level Overlaps", group=grp_liq,
+     tooltip="Removes overlapping zones at the same level. Different levels use containment instead.")
+show_liq_decay    = input.bool(true, "Show Health %", group=grp_liq, tooltip="Display remaining health % on each active zone.")
+show_liq_level_tag = input.bool(true, "Show Level Tag (M / L / μ)", group=grp_liq, tooltip="Show hierarchy tag above each zone: M=Macro, L=Local, μ=Micro.")
+liq_zone_capacity  = input.float(5.0, "Zone Capacity (x avg vol)", group=grp_liq, minval=1.0, tooltip="How much volume a zone can absorb before considered depleted.")
+liq_min_height_atr = input.float(0.10, "Min Zone Height (x ATR)", group=grp_liq, minval=0.01, step=0.05, tooltip="Minimum zone height in ATR multiples. Prevents tiny noise zones.")
+bsl_outline_col    = input.color(color.new(C_BSL, 0), "BSL Outline", group=grp_liq)
+ssl_outline_col    = input.color(color.new(C_SSL, 0), "SSL Outline", group=grp_liq)
+liq_buy_delta_col  = input.color(color.new(C_SSL, 0), "Delta: Buying", group=grp_liq)
+liq_sell_delta_col = input.color(color.new(C_BSL, 0), "Delta: Selling", group=grp_liq)
+
+// — MTF —
+grp_mtf = "Multi-Timeframe Filter"
+use_mtf        = input.bool(true, "Enable MTF Trend Filter", group=grp_mtf, tooltip="Filter signals against higher timeframe trend. Improves win rate.")
+mtf_tf         = input.timeframe("240", "MTF Timeframe", group=grp_mtf, tooltip="Higher timeframe for trend confirmation. 240 = H4 on H1 chart.")
+mtf_ema_fast   = input.int(20, "MTF EMA Fast", group=grp_mtf, tooltip="Fast EMA period on the MTF timeframe.")
+mtf_ema_slow   = input.int(50, "MTF EMA Slow", group=grp_mtf, tooltip="Slow EMA period on the MTF timeframe.")
+
+// — SESSION —
+grp_session = "Session Filter"
+use_session   = input.bool(false, "Use Session Filter", group=grp_session, tooltip="Only generate signals within the specified trading session.")
+session_time  = input.session("0600-1800", "Trading Session", group=grp_session, tooltip="Session window in HHMM-HHMM format (exchange timezone).")
+
+// — CONTEXT ENGINE V10 —
+grp_ctx = "Context Engine"
+ctx_preset = input.string("Balanced", "Context Preset", group=grp_ctx, options=["Aggressive", "Balanced", "Conservative", "Custom"],
+     tooltip="Aggressive = lower thresholds, more signals. Conservative = higher thresholds, fewer signals. Custom = manual weights.")
+ctx_w_trend  = input.float(0.25, "Custom: Weight Trend", group=grp_ctx, tooltip="Relative weight of trend context in signal confidence.")
+ctx_w_vol    = input.float(0.20, "Custom: Weight Volatility", group=grp_ctx, tooltip="Relative weight of volatility context in signal confidence.")
+ctx_w_loc    = input.float(0.20, "Custom: Weight Location", group=grp_ctx, tooltip="Relative weight of location (VWAP) context in signal confidence.")
+ctx_w_liq    = input.float(0.20, "Custom: Weight Liquidity", group=grp_ctx, tooltip="Relative weight of liquidity zone context in signal confidence.")
+ctx_w_sweep  = input.float(0.15, "Custom: Weight Sweep", group=grp_ctx, tooltip="Relative weight of sweep quality context in signal confidence.")
+use_div   = input.bool(true, "Use RSI Divergence", group=grp_ctx, tooltip="Detect RSI divergence as a context factor.")
+div_hard_filter = input.bool(false, "Divergence as Hard Contradiction", group=grp_ctx, tooltip="If enabled, divergence blocks signals in the opposing direction entirely.")
+only_trend = input.bool(true, "Only Trade in Trend", group=grp_ctx, tooltip="Block counter-trend signals. Only allow signals in the EMA trend direction.")
+min_atr_ratio = input.float(0.5, "Min ATR Ratio", group=grp_ctx, tooltip="Minimum ATR/SMA ratio to consider market active enough for signals.")
+
+// — SIGNAL GRADING —
+grp_grade = "Signal Grading"
+grade_ap_thresh = input.float(80.0, "A+ Threshold %", group=grp_grade, minval=50, maxval=100, tooltip="Confidence % required for A+ grade. Highest quality signals.")
+grade_a_thresh  = input.float(65.0, "A Threshold %", group=grp_grade, minval=40, maxval=90, tooltip="Confidence % required for A grade. Strong signals.")
+grade_b_thresh  = input.float(50.0, "B Threshold %", group=grp_grade, minval=30, maxval=80, tooltip="Confidence % required for B grade. Acceptable signals.")
+grade_c_thresh  = input.float(35.0, "C Threshold %", group=grp_grade, minval=20, maxval=70, tooltip="Confidence % for C grade. Weak signals, shown as small dots.")
+require_fvg_confluence = input.bool(true, "A+ Requires FVG Confluence", group=grp_grade, tooltip="A+ signals must have an unfilled FVG nearby.")
+require_liq_confluence = input.bool(true, "A Requires Liquidity Confluence", group=grp_grade, tooltip="A signals must have a recently swept liquidity zone nearby.")
+
+// — SWEEP TRACKER —
+grp_sweep = "SweepTracker Engine"
+sweep_length      = input.int(20, "Sweep Lookback", group=grp_sweep, minval=5, maxval=100, tooltip="Bars to look back for high/low break detection.")
+sweep_vol_mult_n  = input.float(2.0, "Sweep Volume Mult (Normal)", group=grp_sweep, minval=0.5, step=0.1, tooltip="Volume must exceed SMA by this multiple to qualify as sweep. Adjusted by normalization.")
+sweep_timeout     = input.int(4, "Sweep Reversal Timeout (bars)", group=grp_sweep, minval=1, maxval=10, tooltip="Max bars to wait for price to reclaim the sweep level.")
+sweep_cooldown    = input.int(2, "Sweep Cooldown (bars)", group=grp_sweep, minval=0, maxval=10, tooltip="Min bars between consecutive sweep signals.")
+sweep_use_ai      = input.bool(true, "Filter Sweep with Context", group=grp_sweep, tooltip="Only fire signals when context confidence meets grade thresholds.")
+sweep_use_mtf     = input.bool(true, "Filter Sweep with MTF", group=grp_sweep, tooltip="Require MTF trend alignment for sweep signals.")
+sweep_use_trend   = input.bool(true, "Filter Sweep with Local Trend", group=grp_sweep, tooltip="Require local EMA trend alignment for sweep signals.")
+sweep_use_session = input.bool(false, "Filter Sweep with Session", group=grp_sweep, tooltip="Only fire signals within the trading session window.")
+show_sweep_levels = input.bool(false, "Show Sweep Break Levels", group=grp_sweep, tooltip="Plot the rolling high/low levels that trigger sweeps.")
+sweep_line_style  = input.string("Circles", "Sweep Level Style", group=grp_sweep, options=["Circles", "Steps", "Solid"])
+show_sweep_zones  = input.bool(true, "Show Sweep Zone", group=grp_sweep, tooltip="Highlight the zone between sweep level and extremum while active.")
+
+// — MULTI-ASSET NORMALIZATION —
+grp_norm = "Multi-Asset Normalization"
+enable_normalization = input.bool(true, "Enable Auto-Normalization", group=grp_norm, tooltip="Auto-adjust sweep volume, FVG ATR, and min ATR thresholds based on asset volatility profile.")
+norm_lookback = input.int(100, "Normalization Lookback", group=grp_norm, minval=50, maxval=500, tooltip="Bars used to calculate ATR percentile rank. Higher = smoother normalization.")
+norm_atr_sensitivity = input.float(0.5, "ATR Regime Sensitivity", group=grp_norm, minval=0.1, maxval=1.0, step=0.1, tooltip="How aggressively thresholds adjust to volatility. 1.0 = full adjustment, 0.1 = minimal.")
+
+// — FALSE SWEEP DETECTION —
+grp_false = "False Sweep Detection"
+enable_false_sweep = input.bool(true, "Enable False Sweep Filter", group=grp_false, tooltip="Detect and flag sweeps that likely are NOT institutional liquidity events. Downgrades signal grade by 1 level.")
+false_sweep_min_depth = input.float(0.3, "Min Depth (x ATR)", group=grp_false, minval=0.1, maxval=1.0, step=0.05, tooltip="Sweeps penetrating less than this ATR multiple are suspiciously shallow.")
+false_sweep_vol_ratio = input.float(0.7, "Min Vol Ratio vs Sweep Avg", group=grp_false, minval=0.3, maxval=1.5, step=0.1, tooltip="Sweep volume below this ratio of running average suggests lack of institutional participation.")
+false_sweep_body_ratio = input.float(0.6, "Max Body/Range for False", group=grp_false, minval=0.3, maxval=0.9, step=0.1, tooltip="Large body relative to range suggests momentum bar, not a liquidity sweep.")
+false_sweep_rsi_extreme = input.bool(true, "RSI Extreme Check", group=grp_false, tooltip="If RSI is NOT in oversold/overbought zone, there is no rejection pressure, suggesting false sweep.")
+
+// — VSA —
+grp_vsa = "VSA Patterns (SV / NS)"
+max_vsa_markers   = input.int(40, "Max Markers", group=grp_vsa, minval=10, maxval=180, tooltip="Maximum number of SV/NS labels on chart.")
+vsa_lbl_size      = input.string("Small", "Label Size", group=grp_vsa, options=["Tiny", "Small", "Normal"])
+show_stopping_vol = input.bool(true, "Show Stopping Vol", group=grp_vsa, tooltip="Detect and mark Stopping Vol bars (high volume, shrinking body).")
+sv_text_col       = input.color(color.rgb(168, 85, 247), "SV Color", group=grp_vsa)
+sv_text_tr        = input.int(0, "SV Transparency", group=grp_vsa, minval=0, maxval=100)
+sv_show_label     = input.bool(true, "Show SV Label", group=grp_vsa)
+show_no_supply    = input.bool(true, "Show No Supply", group=grp_vsa, tooltip="Detect and mark No Supply bars (low volume, expanding body).")
+ns_text_col       = input.color(color.rgb(168, 85, 247), "NS Color", group=grp_vsa)
+ns_text_tr        = input.int(0, "NS Transparency", group=grp_vsa, minval=0, maxval=100)
+ns_show_label     = input.bool(true, "Show NS Label", group=grp_vsa)
+
+sv_text_final = color.new(sv_text_col, sv_text_tr)
+ns_text_final = color.new(ns_text_col, ns_text_tr)
+vsa_lbl_sz    = vsa_lbl_size == "Tiny" ? size.tiny : vsa_lbl_size == "Normal" ? size.normal : size.small
+
+// — FVG —
+grp_fvg = "Fair Value Gap (FVG)"
+enable_fvg         = input.bool(true, "Enable FVG", group=grp_fvg, tooltip="Detect and draw Fair Value Gaps on chart.")
+show_fvg_chart     = input.bool(true, "Show FVG (Current TF)", group=grp_fvg, tooltip="Draw FVG zones on the current timeframe.")
+show_fvg_htf       = input.bool(true, "Show FVG (HTF)", group=grp_fvg, tooltip="Draw FVG zones from the higher timeframe.")
+fvg_htf_tf         = input.timeframe("60", "HTF Timeframe", group=grp_fvg, tooltip="Higher timeframe for HTF FVG detection.")
+fvg_strength_preset = input.string("Balanced", "FVG Strength Preset", group=grp_fvg, options=["Relaxed", "Balanced", "Strict", "Custom"], tooltip="Relaxed = more FVGs, Strict = fewer but stronger, Custom = manual settings below.")
+fvg_min_atr_mult   = input.float(0.15, "Custom: Min Gap (x ATR)", group=grp_fvg, minval=0.01, step=0.01, tooltip="Minimum FVG size in ATR multiples.")
+fvg_min_ticks      = input.int(4, "Custom: Min Gap (ticks)", group=grp_fvg, minval=1, tooltip="Minimum FVG size in ticks.")
+fvg_require_disp   = input.bool(true, "Custom: Require Displacement", group=grp_fvg, tooltip="FVG candle body must exceed median body size by multiplier.")
+fvg_disp_body_mult = input.float(1.2, "Custom: Body x Median", group=grp_fvg, minval=0.5, step=0.1, tooltip="Displacement multiplier: candle body vs 20-bar median body.")
+fvg_require_impulse = input.bool(true, "Custom: Require Impulse", group=grp_fvg, tooltip="FVG candle must be in the same direction as the gap.")
+max_fvg_zones      = input.int(12, "Max FVG Current TF (per side)", group=grp_fvg, minval=2, maxval=60, tooltip="Maximum number of active FVG zones per side on current TF.")
+max_fvg_htf_zones  = input.int(8, "Max FVG HTF (per side)", group=grp_fvg, minval=2, maxval=40, tooltip="Maximum number of active FVG zones per side on HTF.")
+fvg_remove_on_fill = input.bool(true, "Remove on Full Fill", group=grp_fvg, tooltip="Delete FVG zone when price fully fills the gap.")
+fvg_show_labels    = input.bool(true, "Show HTF FVG Labels", group=grp_fvg, tooltip="Display TF label on HTF FVG zones.")
+fvg_label_size     = input.string("Small", "FVG Label Size", group=grp_fvg, options=["Tiny", "Small", "Normal"])
+
+grp_fvg_col = "FVG Colors (Current TF)"
+fvg_bull_base      = input.color(C_FVG_BULL, "Bull Fill", group=grp_fvg_col)
+fvg_bull_bg_tr     = input.int(88, "Bull Fill %", group=grp_fvg_col, minval=0, maxval=100, tooltip="Transparency of bullish FVG fill. 0 = opaque, 100 = invisible.")
+fvg_bull_bd_tr     = input.int(45, "Bull Border %", group=grp_fvg_col, minval=0, maxval=100)
+fvg_bear_base      = input.color(C_FVG_BEAR, "Bear Fill", group=grp_fvg_col)
+fvg_bear_bg_tr     = input.int(88, "Bear Fill %", group=grp_fvg_col, minval=0, maxval=100, tooltip="Transparency of bearish FVG fill. 0 = opaque, 100 = invisible.")
+fvg_bear_bd_tr     = input.int(45, "Bear Border %", group=grp_fvg_col, minval=0, maxval=100)
+fvg_lbl_col        = input.color(color.white, "Label Color", group=grp_fvg_col)
+fvg_lbl_tr         = input.int(0, "Label Transparency", group=grp_fvg_col, minval=0, maxval=100)
+
+grp_fvg_htf_col = "FVG Colors (HTF)"
+fvg_htf_own_colors = input.bool(false, "Separate HTF Palette", group=grp_fvg_htf_col, tooltip="Use different colors for HTF FVG zones.")
+fvg_htf_bull_base  = input.color(color.rgb(14, 165, 233), "HTF Bull Fill", group=grp_fvg_htf_col)
+fvg_htf_bull_bg_tr = input.int(90, "HTF Bull Fill %", group=grp_fvg_htf_col, minval=0, maxval=100)
+fvg_htf_bull_bd_tr = input.int(50, "HTF Bull Border %", group=grp_fvg_htf_col, minval=0, maxval=100)
+fvg_htf_bear_base  = input.color(color.rgb(249, 115, 22), "HTF Bear Fill", group=grp_fvg_htf_col)
+fvg_htf_bear_bg_tr = input.int(90, "HTF Bear Fill %", group=grp_fvg_htf_col, minval=0, maxval=100)
+fvg_htf_bear_bd_tr = input.int(50, "HTF Bear Border %", group=grp_fvg_htf_col, minval=0, maxval=100)
+
+fvg_bull_bg     = color.new(fvg_bull_base, fvg_bull_bg_tr)
+fvg_bull_border = color.new(fvg_bull_base, fvg_bull_bd_tr)
+fvg_bear_bg     = color.new(fvg_bear_base, fvg_bear_bg_tr)
+fvg_bear_border = color.new(fvg_bear_base, fvg_bear_bd_tr)
+fvg_htf_bull_bg     = fvg_htf_own_colors ? color.new(fvg_htf_bull_base, fvg_htf_bull_bg_tr) : fvg_bull_bg
+fvg_htf_bull_border = fvg_htf_own_colors ? color.new(fvg_htf_bull_base, fvg_htf_bull_bd_tr) : fvg_bull_border
+fvg_htf_bear_bg     = fvg_htf_own_colors ? color.new(fvg_htf_bear_base, fvg_htf_bear_bg_tr) : fvg_bear_bg
+fvg_htf_bear_border = fvg_htf_own_colors ? color.new(fvg_htf_bear_base, fvg_htf_bear_bd_tr) : fvg_bear_border
+fvg_lbl_final   = color.new(fvg_lbl_col, fvg_lbl_tr)
+fvg_lbl_sz      = fvg_label_size == "Tiny" ? size.tiny : fvg_label_size == "Normal" ? size.normal : size.small
+
+// — HV LEVELS —
+grp_hv = "Prev Session High-Vol Levels"
+show_hv_levels = input.bool(true, "Show Prev Session HV Levels", group=grp_hv, tooltip="Plot high and low of the highest-volume bar from the previous session.")
+hv_line_width  = input.int(2, "HV Line Width", group=grp_hv, minval=1, maxval=5)
+hv_line_style  = input.string("Circles", "HV Line Style", group=grp_hv, options=["Circles", "Steps", "Solid"])
+
+// — PERFORMANCE —
+grp_perf = "Performance"
+max_history = input.int(500, "Max Bars Back", group=grp_perf, tooltip="Maximum bars to keep in calculations. Lower = faster but less history.")
+vol_fast_len   = input.int(20,  "Fast Volume SMA", group=grp_perf, tooltip="Short-term volume moving average for comparison.")
+vol_baseline_len = input.int(200, "Volume Baseline SMA", group=grp_perf, tooltip="Long-term volume baseline for normalization.")
+
+// ──────────────────────────────────────────────────────
+// 3️⃣ TYPES
+// ──────────────────────────────────────────────────────
+// Zone Level: 0=Micro, 1=Local, 2=Macro
+type LiqZone
+    float top
+    float bottom
+    int left
+    int right
+    bool swept
+    box[] quads
+    float[] deltas
+    box outline
+    float volumeTraded
+    float capacity
+    bool wasHit
+    label decayLabel
+    int level          // V10: 0=Micro, 1=Local, 2=Macro
+    label levelTag     // V10: level tag label
+
+// ──────────────────────────────────────────────────────
+// 4️⃣ HELPERS
+// ──────────────────────────────────────────────────────
+trim_label_array(arr, max_sz) =>
+    while array.size(arr) > max_sz
+        lb = array.shift(arr)
+        if not na(lb)
+            label.delete(lb)
+
+clear_label_array(arr) =>
+    szb = array.size(arr)
+    if szb > 0
+        for cj = 0 to szb - 1
+            lb0 = array.get(arr, cj)
+            if not na(lb0)
+                label.delete(lb0)
+    array.clear(arr)
+
+f_liq_delete_zone(LiqZone z) =>
+    if not na(z)
+        for bx in z.quads
+            if not na(bx)
+                box.delete(bx)
+        if not na(z.outline)
+            box.delete(z.outline)
+        if not na(z.decayLabel)
+            label.delete(z.decayLabel)
+        if not na(z.levelTag)
+            label.delete(z.levelTag)
+
+f_liq_pop_zone(array<LiqZone> zones) =>
+    if array.size(zones) > 0
+        LiqZone rm = array.pop(zones)
+        f_liq_delete_zone(rm)
+
+f_bar_overlap(float barH, float barL, float qTop, float qBot) =>
+    oTop = math.min(barH, qTop)
+    oBot = math.max(barL, qBot)
+    oTop > oBot ? oTop - oBot : 0.0
+
+f_liq_quad_color(color baseC, int trans) =>
+    color.rgb(color.r(baseC), color.g(baseC), color.b(baseC), trans)
+
+f_liq_level_outline_col(int lvl, bool isBsl) =>
+    base = isBsl ? bsl_outline_col : ssl_outline_col
+    lvl == 2 ? color.new(C_MACRO, 20) : lvl == 0 ? color.new(C_MICRO, 30) : base
+
+f_liq_level_tag_str(int lvl) =>
+    lvl == 2 ? "M" : lvl == 0 ? "μ" : "L"
+
+f_liq_level_border_width(int lvl) =>
+    lvl == 2 ? 2 : lvl == 0 ? 1 : 1
+
+method liq_update_visuals(LiqZone z, bool isBsl, color buyC, color sellC, color bslC, color sslC) =>
+    maxD = 0.0
+    for d in z.deltas
+        maxD := math.max(maxD, math.abs(d))
+    for i = 0 to 3
+        d = z.deltas.get(i)
+        c = color(na)
+        txt = "0"
+        tColor = color(na)
+        baseC = isBsl ? bslC : sslC
+        if maxD > 0 and math.abs(d) > 0.001
+            dBase = d > 0 ? buyC : sellC
+            trans = z.swept ? 90 : 100 - int((math.abs(d) / maxD) * 60)
+            c := f_liq_quad_color(dBase, trans)
+            txt := (d > 0 ? "+" : "-") + str.tostring(math.abs(d), format.volume)
+            tColor := color.new(dBase, z.swept ? 50 : 0)
+        else
+            defTr = 60 + (isBsl ? (3 - i) : i) * 10
+            c := f_liq_quad_color(baseC, z.swept ? 90 : defTr)
+            tColor := color.new(baseC, z.swept ? 80 : 50)
+        q = z.quads.get(i)
+        q.set_bgcolor(not show_liq_swept and z.swept ? na : c)
+        q.set_text(not show_liq_swept and z.swept ? "" : txt)
+        q.set_text_color(not show_liq_swept and z.swept ? na : tColor)
+        if z.swept
+            q.set_border_color(not show_liq_swept ? na : color.new(baseC, 80))
+            q.set_border_style(line.style_dashed)
+        else
+            q.set_border_color(color.new(baseC, 60))
+            q.set_border_style(line.style_solid)
+    if z.swept
+        if show_liq_swept
+            z.outline.set_border_style(line.style_dashed)
+            z.outline.set_border_color(color.new(isBsl ? bslC : sslC, 80))
+        else
+            z.outline.set_border_color(na)
+
+f_liq_create_quads(int pivotIdx, float pTop, float pBot, bool isBsl, color outlineC, int lvl) =>
+    quads = array.new<box>(4)
+    step = (pTop - pBot) / 4.0
+    bw = f_liq_level_border_width(lvl)
+    for i = 0 to 3
+        qBot = pBot + i * step
+        qTop = pBot + (i + 1) * step
+        gap = step * 0.05
+        bTop = qTop - gap
+        bBot = qBot + gap
+        if i == 0
+            bBot := qBot
+        if i == 3
+            bTop := qTop
+        trans = 60 + (isBsl ? (3 - i) : i) * 10
+        c = f_liq_quad_color(outlineC, trans)
+        quads.set(i, box.new(pivotIdx, bTop, pivotIdx, bBot, border_color=color.new(outlineC, 60), bgcolor=c, text="0", text_color=color.new(outlineC, 50), text_halign=text.align_right, text_size=size.auto, border_width=bw))
+    quads
+
+f_liq_try_create_zone(array<LiqZone> zones, int pivotIdx, float pHigh, float pBot, float cap, bool isBsl, int lvl) =>
+    skip = false
+    if filter_liq_overlap and array.size(zones) > 0
+        for i = array.size(zones) - 1 to 0
+            if i < array.size(zones)
+                ex = zones.get(i)
+                // V10: only filter overlap within same level
+                if not ex.swept and ex.level == lvl
+                    overlaps = math.max(pBot, ex.bottom) <= math.min(pHigh, ex.top)
+                    if overlaps
+                        if pHigh > ex.top
+                            f_liq_delete_zone(ex)
+                            zones.remove(i)
+                        else
+                            skip := true
+                            break
+    if not skip
+        outlineC = f_liq_level_outline_col(lvl, isBsl)
+        quads = f_liq_create_quads(pivotIdx, pHigh, pBot, isBsl, outlineC, lvl)
+        bw = f_liq_level_border_width(lvl)
+        outline = box.new(pivotIdx, pHigh, pivotIdx, pBot, border_color=color.new(outlineC, 80), bgcolor=na, border_width=bw)
+        dLbl = label.new(bar_index, pBot + (pHigh - pBot) / 2.0, "100%", style=label.style_label_left, color=color.new(outlineC, 80), textcolor=color.white, size=size.small)
+        if not show_liq_decay
+            dLbl.set_x(na)
+        tagStr = show_liq_level_tag ? f_liq_level_tag_str(lvl) : ""
+        tagLbl = label.new(bar_index, pHigh, tagStr, style=label.style_label_down, color=color.new(outlineC, 70), textcolor=color.white, size=size.tiny)
+        if not show_liq_level_tag
+            tagLbl.set_x(na)
+        deltas = array.new_float(4, 0.0)
+        zones.unshift(LiqZone.new(pHigh, pBot, pivotIdx, pivotIdx, false, quads, deltas, outline, 0.0, cap, false, dLbl, lvl, tagLbl))
+        while array.size(zones) > max_liq_zones
+            f_liq_pop_zone(zones)
+
+method liq_process_bar(LiqZone z, bool isBsl, float barH, float barL, float barDelta, float barVol, float totalRange) =>
+    if not z.swept
+        z.right := bar_index
+        z.outline.set_right(bar_index)
+        for bx in z.quads
+            bx.set_right(bar_index)
+        hit = false
+        step = (z.top - z.bottom) / 4.0
+        for j = 0 to 3
+            qBot = z.bottom + j * step
+            qTop = z.bottom + (j + 1) * step
+            overlap = f_bar_overlap(barH, barL, qTop, qBot)
+            if overlap > 0
+                hit := true
+                overlapRatio = totalRange == 0 ? 0.0 : overlap / totalRange
+                z.deltas.set(j, z.deltas.get(j) + barDelta * overlapRatio)
+                z.volumeTraded += barVol * overlapRatio
+        if isBsl and barH > z.top
+            z.swept := true
+            z.outline.set_right(bar_index)
+            z.outline.set_extend(extend.none)
+            for bx in z.quads
+                bx.set_right(bar_index)
+                bx.set_extend(extend.none)
+        if not isBsl and barL < z.bottom
+            z.swept := true
+            z.outline.set_right(bar_index)
+            z.outline.set_extend(extend.none)
+            for bx in z.quads
+                bx.set_right(bar_index)
+                bx.set_extend(extend.none)
+        if not z.swept
+            if show_liq_decay
+                health = int(math.max(0, 100 - (z.volumeTraded / z.capacity * 100)))
+                z.decayLabel.set_x(bar_index + 1)
+                z.decayLabel.set_text(str.tostring(health) + "%")
+            else
+                z.decayLabel.set_x(na)
+        else
+            if not na(z.decayLabel)
+                label.delete(z.decayLabel)
+                z.decayLabel := na
+            if not na(z.levelTag)
+                label.delete(z.levelTag)
+                z.levelTag := na
+        z.wasHit := hit
+        if hit or z.swept
+            z.liq_update_visuals(isBsl, liq_buy_delta_col, liq_sell_delta_col, bsl_outline_col, ssl_outline_col)
+
+// ─── FVG HELPERS ───
+f_fvg_delete_one(linefill lf) =>
+    if not na(lf)
+        ln1 = linefill.get_line1(lf)
+        ln2 = linefill.get_line2(lf)
+        linefill.delete(lf)
+        if not na(ln1)
+            line.delete(ln1)
+        if not na(ln2)
+            line.delete(ln2)
+
+f_fvg_remove_at(array<linefill> fill_arr, array<float> top_arr, array<float> bot_arr, array<label> lbl_arr, int idx) =>
+    f_fvg_delete_one(array.get(fill_arr, idx))
+    array.remove(fill_arr, idx)
+    array.remove(top_arr, idx)
+    array.remove(bot_arr, idx)
+    if array.size(lbl_arr) > idx
+        lbRm = array.get(lbl_arr, idx)
+        if not na(lbRm)
+            label.delete(lbRm)
+        array.remove(lbl_arr, idx)
+
+f_fvg_finalize_at(array<linefill> fill_arr, int idx, bool use_bar_time) =>
+    lf = array.get(fill_arr, idx)
+    if not na(lf)
+        ln1 = linefill.get_line1(lf)
+        ln2 = linefill.get_line2(lf)
+        x2 = use_bar_time ? time : bar_index
+        line.set_extend(ln1, extend.none)
+        line.set_extend(ln2, extend.none)
+        line.set_x2(ln1, x2)
+        line.set_x2(ln2, x2)
+
+clear_fvg_zones(array<linefill> fill_arr, array<float> top_arr, array<float> bot_arr, array<label> lbl_arr) =>
+    n = array.size(fill_arr)
+    if n > 0
+        for j = 0 to n - 1
+            f_fvg_delete_one(array.get(fill_arr, j))
+    array.clear(fill_arr)
+    array.clear(top_arr)
+    array.clear(bot_arr)
+    clear_label_array(lbl_arr)
+
+trim_fvg_zones(array<linefill> fill_arr, array<float> top_arr, array<float> bot_arr, array<label> lbl_arr, int max_sz) =>
+    while array.size(fill_arr) > max_sz
+        f_fvg_remove_at(fill_arr, top_arr, bot_arr, lbl_arr, 0)
+
+prune_fvg_filled(array<linefill> fill_arr, array<float> top_arr, array<float> bot_arr, array<label> lbl_arr, bool is_bull, bool use_bar_time) =>
+    i = 0
+    while i < array.size(fill_arr)
+        gap_top = array.get(top_arr, i)
+        gap_bot = array.get(bot_arr, i)
+        filled = is_bull ? low <= gap_bot : high >= gap_top
+        if filled and fvg_remove_on_fill
+            f_fvg_remove_at(fill_arr, top_arr, bot_arr, lbl_arr, i)
+        if filled and not fvg_remove_on_fill
+            f_fvg_finalize_at(fill_arr, i, use_bar_time)
+            if array.size(lbl_arr) > i
+                lbRm = array.get(lbl_arr, i)
+                if not na(lbRm)
+                    label.delete(lbRm)
+                array.remove(lbl_arr, i)
+            array.remove(fill_arr, i)
+            array.remove(top_arr, i)
+            array.remove(bot_arr, i)
+        if not filled
+            i += 1
+
+prune_fvg_left_of(array<linefill> fill_arr, array<float> top_arr, array<float> bot_arr, array<label> lbl_arr, int min_bar) =>
+    i = 0
+    while i < array.size(fill_arr)
+        lf = array.get(fill_arr, i)
+        ln1 = na(lf) ? na : linefill.get_line1(lf)
+        x1 = na(ln1) ? na : line.get_x1(ln1)
+        if na(lf) or (not na(x1) and x1 < min_bar)
+            f_fvg_remove_at(fill_arr, top_arr, bot_arr, lbl_arr, i)
+        if not na(lf) and (na(x1) or x1 >= min_bar)
+            i += 1
+
+prune_fvg_before_time(array<linefill> fill_arr, array<float> top_arr, array<float> bot_arr, array<label> lbl_arr, int min_time) =>
+    i = 0
+    while i < array.size(fill_arr)
+        lf = array.get(fill_arr, i)
+        ln1 = na(lf) ? na : linefill.get_line1(lf)
+        t1 = na(ln1) ? na : line.get_x1(ln1)
+        if na(lf) or (not na(min_time) and not na(t1) and t1 < min_time)
+            f_fvg_remove_at(fill_arr, top_arr, bot_arr, lbl_arr, i)
+        if not na(lf) and (na(min_time) or na(t1) or t1 >= min_time)
+            i += 1
+
+f_fvg_add_label(array<label> lbl_arr, int t_mid, float y_mid, string txt) =>
+    lb = label.new(t_mid, y_mid, txt, xloc=xloc.bar_time, style=label.style_label_center, color=color.new(color.black, 100), textcolor=fvg_lbl_final, size=fvg_lbl_sz)
+    array.push(lbl_arr, lb)
+
+f_fvg_add_zone(array<linefill> fill_arr, array<float> top_arr, array<float> bot_arr, array<label> lbl_arr, int x_left, int x_right, float y_top, float y_bot, color fill_c, color border_c, bool use_time, int t_left, int t_right, string lbl_txt) =>
+    topLn = use_time ? line.new(t_left, y_top, t_right, y_top, xloc=xloc.bar_time, extend=extend.right, color=border_c, width=1) : line.new(x_left, y_top, x_right, y_top, extend=extend.right, color=border_c, width=1)
+    botLn = use_time ? line.new(t_left, y_bot, t_right, y_bot, xloc=xloc.bar_time, extend=extend.right, color=border_c, width=1) : line.new(x_left, y_bot, x_right, y_bot, extend=extend.right, color=border_c, width=1)
+    lf = linefill.new(topLn, botLn, fill_c)
+    array.push(fill_arr, lf)
+    array.push(top_arr, y_top)
+    array.push(bot_arr, y_bot)
+    if str.length(lbl_txt) > 0
+        t_mid = t_left + int(math.round((t_right - t_left) / 2.0))
+        f_fvg_add_label(lbl_arr, t_mid, (y_top + y_bot) / 2.0, lbl_txt)
+
+f_fmt_tf(string tf) =>
+    tf == "1" ? "M1" : tf == "5" ? "M5" : tf == "15" ? "M15" : tf == "30" ? "M30" : tf == "60" ? "H1" : tf == "240" ? "H4" : tf == "D" ? "D" : tf == "W" ? "W" : tf
+
+f_fvg_preset_atr_mult() =>
+    fvg_strength_preset == "Relaxed" ? 0.08 : fvg_strength_preset == "Strict" ? 0.22 : fvg_strength_preset == "Balanced" ? 0.15 : fvg_min_atr_mult
+
+f_fvg_preset_ticks() =>
+    fvg_strength_preset == "Relaxed" ? 2 : fvg_strength_preset == "Strict" ? 8 : fvg_strength_preset == "Balanced" ? 4 : fvg_min_ticks
+
+f_fvg_preset_disp() =>
+    fvg_strength_preset == "Relaxed" ? false : fvg_strength_preset == "Strict" ? true : fvg_strength_preset == "Balanced" ? true : fvg_require_disp
+
+f_fvg_preset_impulse() =>
+    fvg_strength_preset == "Relaxed" ? false : fvg_strength_preset == "Strict" ? true : fvg_strength_preset == "Balanced" ? true : fvg_require_impulse
+
+f_fvg_is_strong(bull_new, bear_new, gap_top, gap_bot, _atr, _norm_fvg_adj) =>
+    raw = bull_new or bear_new
+    gs = gap_top - gap_bot
+    minAtr = _norm_fvg_adj
+    minTk = f_fvg_preset_ticks()
+    szOk = gs >= _atr * minAtr and gs >= minTk * syminfo.mintick
+    body1 = math.abs(close[1] - open[1])
+    medB = ta.sma(math.abs(close - open), 20)
+    dispOk = not f_fvg_preset_disp() or body1 >= medB * fvg_disp_body_mult
+    impOk = not f_fvg_preset_impulse() or (bull_new ? close[1] > open[1] and close > open : close[1] < open[1] and close < open)
+    raw and szOk and dispOk and impOk
+
+f_fvg_new_flags(_atr, _norm_fvg_adj) =>
+    bull_raw = bar_index >= 2 and low > high[2] and not (bar_index >= 3 and low[1] > high[3])
+    bear_raw = bar_index >= 2 and high < low[2] and not (bar_index >= 3 and high[1] < low[3])
+    b_top = low
+    b_bot = high[2]
+    s_top = low[2]
+    s_bot = high
+    // Call f_fvg_is_strong() unconditionally to avoid inconsistent historical calculations
+    bull_strong = f_fvg_is_strong(true, false, b_top, b_bot, _atr, _norm_fvg_adj)
+    bear_strong = f_fvg_is_strong(false, true, s_top, s_bot, _atr, _norm_fvg_adj)
+    bull = bull_raw and bull_strong
+    bear = bear_raw and bear_strong
+    [bull, bear]
+
+f_fvg_htf_pulse() =>
+    htf_atr = ta.atr(14)
+    htf_norm = f_fvg_preset_atr_mult()
+    [bull_new, bear_new] = f_fvg_new_flags(htf_atr, htf_norm)
+    evt = bull_new ? 1.0 : bear_new ? -1.0 : 0.0
+    gap_top = bull_new ? low : bear_new ? low[2] : na
+    gap_bot = bull_new ? high[2] : bear_new ? high : na
+    t_left = time[2]
+    t_right = time
+    [evt, gap_top, gap_bot, t_left, t_right]
+
+// ──────────────────────────────────────────────────────
+// 5️⃣ MTF + SESSION
+// ──────────────────────────────────────────────────────
+get_mtf_trend() =>
+    f = ta.ema(close, mtf_ema_fast)
+    s = ta.ema(close, mtf_ema_slow)
+    f > s ? 1 : -1
+
+mtf_trend_raw = request.security(syminfo.tickerid, mtf_tf, get_mtf_trend(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+mtf_trend = use_mtf ? mtf_trend_raw : 0
+in_session = not use_session or not na(time(timeframe.period, session_time))
+
+// ──────────────────────────────────────────────────────
+// 6️⃣ METRICS
+// ──────────────────────────────────────────────────────
+last_visible_bar = bar_index - max_history
+vol_ma       = ta.sma(volume, vol_fast_len)
+vol_baseline = ta.sma(volume, vol_baseline_len)
+vwap_val     = ta.vwap(hlc3)
+rsi          = ta.rsi(close, 14)
+atr          = ta.atr(14)
+ema_f        = ta.ema(close, 50)
+ema_s        = ta.ema(close, 200)
+trend_direction = ema_f > ema_s ? 1 : -1
+atr_sma50    = ta.sma(atr, 50)
+atr_sma20    = ta.sma(atr, 20)
+atr_ratio_regime = atr / atr_sma50
+market_regime = atr_ratio_regime < 0.5 ? 0 : (atr_ratio_regime < 0.8 ? 1 : (atr_ratio_regime < 1.2 ? 2 : 3))
+
+float barVol = nz(volume)
+float totalRange = high - low
+float barDelta = totalRange == 0 ? 0.0 : barVol * (close - open) / totalRange
+float liq_avg_vol = nz(ta.sma(volume, liq_pivot_local))
+if liq_avg_vol == 0
+    liq_avg_vol := 1.0
+float liq_zone_cap = liq_avg_vol * liq_zone_capacity
+
+// ──────────────────────────────────────────────────────
+// PHASE 2: MULTI-ASSET NORMALIZATION
+// ──────────────────────────────────────────────────────
+_baseline_sweep_mult = market_regime <= 1 ? 1.5 : (market_regime == 2 ? sweep_vol_mult_n : math.max(sweep_vol_mult_n, 2.5))
+vol_ratio_raw = vol_baseline > 0 ? barVol / vol_baseline : 1.0
+norm_atr_percentile = enable_normalization ? ta.percentrank(atr_ratio_regime, norm_lookback) : 50.0
+norm_vol_percentile = enable_normalization ? ta.percentrank(vol_ratio_raw, norm_lookback) : 50.0
+norm_range_ratio = atr > 0 ? (high - low) / atr : 1.0
+
+// Regime-based adjustment multipliers
+// Low vol: increase sweep threshold (need more confirmation), decrease FVG ATR (smaller gaps count)
+// High vol: decrease sweep threshold (normal vol is significant), increase FVG ATR (need bigger gaps)
+atr_p = norm_atr_percentile / 100.0
+norm_sweep_vol_adjust = enable_normalization ? (sweep_vol_mult_n * (1.0 + norm_atr_sensitivity * (0.5 - atr_p))) : _baseline_sweep_mult
+norm_fvg_atr_adjust = enable_normalization ? f_fvg_preset_atr_mult() * (1.0 + norm_atr_sensitivity * (atr_p - 0.5) * 0.5) : f_fvg_preset_atr_mult()
+norm_min_atr_adjust = enable_normalization ? min_atr_ratio * (1.0 - norm_atr_sensitivity * (atr_p - 0.5) * 0.3) : min_atr_ratio
+
+// ──────────────────────────────────────────────────────
+// 7️⃣ DIVERGENCES
+// ──────────────────────────────────────────────────────
+detectDivergence(_len, _rsi) =>
+    dv = float(na)
+    dt = 0
+    rsiPeak   = ta.pivothigh(_rsi, _len, _len)
+    pricePeak = ta.pivothigh(high,  _len, _len)
+    rsiLow    = ta.pivotlow(_rsi, _len, _len)
+    priceLow  = ta.pivotlow(low,  _len, _len)
+    if not na(rsiPeak) and not na(pricePeak) and pricePeak > pricePeak[_len] and rsiPeak < rsiPeak[_len]
+        dv := pricePeak
+        dt := 1
+    else if not na(rsiLow) and not na(priceLow) and priceLow < priceLow[_len] and rsiLow > rsiLow[_len]
+        dv := priceLow
+        dt := 2
+    [dv, dt]
+
+var int div_type = 0
+if use_div
+    [v, t] = detectDivergence(12, rsi)
+    div_type := t
+else
+    div_type := 0
+
+// ──────────────────────────────────────────────────────
+// 8️⃣ CONTEXT ENGINE V10
+// ──────────────────────────────────────────────────────
+// Each context returns [long_score, short_score] 0-100
+// 0-25: strongly against, 25-45: weak against, 45-55: neutral, 55-70: weak favor, 70-100: strong favor
+
+f_ctx_weights() =>
+    if ctx_preset == "Aggressive"
+        [0.20, 0.15, 0.20, 0.20, 0.25]
+    else if ctx_preset == "Conservative"
+        [0.30, 0.25, 0.15, 0.20, 0.10]
+    else if ctx_preset == "Balanced"
+        [0.25, 0.20, 0.20, 0.20, 0.15]
+    else
+        [ctx_w_trend, ctx_w_vol, ctx_w_loc, ctx_w_liq, ctx_w_sweep]
+
+// Trend Context: EMA alignment + slope + HTF agreement + compression/expansion
+f_trend_ctx() =>
+    ema_bull = ema_f > ema_s
+    slope = (ema_f - ema_f[5]) / atr
+    htf_agree_long = mtf_trend == 0 or mtf_trend == 1
+    htf_agree_short = mtf_trend == 0 or mtf_trend == -1
+    compression = atr_ratio_regime < 0.8
+    expansion = atr_ratio_regime > 1.2
+    long_base = ema_bull ? 65.0 : 35.0
+    short_base = ema_bull ? 35.0 : 65.0
+    slope_norm = math.max(-2.0, math.min(2.0, slope))
+    long_s = long_base + slope_norm * 10.0 + (htf_agree_long ? 10.0 : -8.0) + (compression ? -5.0 : 0.0) + (expansion and ema_bull ? 5.0 : 0.0)
+    short_s = short_base - slope_norm * 10.0 + (htf_agree_short ? 10.0 : -8.0) + (compression ? -5.0 : 0.0) + (expansion and not ema_bull ? 5.0 : 0.0)
+    [math.max(0, math.min(100, long_s)), math.max(0, math.min(100, short_s))]
+
+// Volatility Context: ATR regime + expansion + min ATR gate
+f_vol_ctx() =>
+    atr_ok = atr > atr_sma20 * min_atr_ratio
+    vol_expansion = atr_ratio_regime > 1.2
+    vol_compression = atr_ratio_regime < 0.6
+    // Favorable for sweeps: expansion or normal with ATR ok
+    base_favor = atr_ok ? 55.0 : 30.0
+    base_favor := base_favor + (vol_expansion ? 15.0 : 0.0) - (vol_compression ? 15.0 : 0.0)
+    // Volatility is direction-neutral but regime-dependent
+    // In high regime, both directions get boost; in low, both get penalty
+    long_s = base_favor + (market_regime >= 2 ? 10.0 : 0.0)
+    short_s = base_favor + (market_regime >= 2 ? 10.0 : 0.0)
+    [math.max(0, math.min(100, long_s)), math.max(0, math.min(100, short_s))]
+
+// Location Context: VWAP distance + proximity to liquidity + proximity to FVG
+f_loc_ctx() =>
+    vwap_dist = (close - vwap_val) / atr
+    // For longs: want price at/below VWAP (buying discount)
+    // For shorts: want price at/above VWAP (selling premium)
+    long_vwap = vwap_dist < -1.0 ? 80.0 : vwap_dist < -0.3 ? 65.0 : vwap_dist < 0.3 ? 50.0 : vwap_dist < 1.0 ? 35.0 : 20.0
+    short_vwap = vwap_dist > 1.0 ? 80.0 : vwap_dist > 0.3 ? 65.0 : vwap_dist > -0.3 ? 50.0 : vwap_dist > -1.0 ? 35.0 : 20.0
+    [long_vwap, short_vwap]
+
+// Liquidity helper functions (must be defined before f_liq_ctx)
+f_liq_count_active_fn(array<LiqZone> zones) =>
+    n = 0
+    if array.size(zones) > 0
+        for z in zones
+            if not z.swept
+                n += 1
+    n
+
+f_liq_min_health_fn(array<LiqZone> zones) =>
+    mn = 100
+    found = false
+    if array.size(zones) > 0
+        for z in zones
+            if not z.swept and z.capacity > 0
+                h = int(math.max(0, 100 - (z.volumeTraded / z.capacity * 100)))
+                mn := math.min(mn, h)
+                found := true
+    found ? mn : na
+
+// Liquidity Context: BSL/SSL pressure + depletion
+f_liq_ctx(array<LiqZone> _bslZ, array<LiqZone> _sslZ) =>
+    bsl_active = f_liq_count_active_fn(_bslZ)
+    ssl_active = f_liq_count_active_fn(_sslZ)
+    bsl_min_h = f_liq_min_health_fn(_bslZ)
+    ssl_min_h = f_liq_min_health_fn(_sslZ)
+    // For longs: SSL below (support swept = fuel), fewer BSL above (less resistance)
+    // For shorts: BSL above (resistance swept = fuel), fewer SSL below
+    long_s = 40.0 + (ssl_active > 0 ? 15.0 : 0.0) + (not na(ssl_min_h) and ssl_min_h < 40 ? 10.0 : 0.0) - (bsl_active > 2 ? 10.0 : 0.0)
+    short_s = 40.0 + (bsl_active > 0 ? 15.0 : 0.0) + (not na(bsl_min_h) and bsl_min_h < 40 ? 10.0 : 0.0) - (ssl_active > 2 ? 10.0 : 0.0)
+    [math.max(0, math.min(100, long_s)), math.max(0, math.min(100, short_s))]
+
+// Sweep Context: quality of the reclaim (populated dynamically)
+var float ctx_sweep_long = 50.0
+var float ctx_sweep_short = 50.0
+
+// Zone arrays (declared here so context engine can reference them)
+var array<LiqZone> bslZones = array.new<LiqZone>()
+var array<LiqZone> sslZones = array.new<LiqZone>()
+
+// Compute context scores
+[trend_long, trend_short] = f_trend_ctx()
+[vol_long, vol_short] = f_vol_ctx()
+[loc_long, loc_short] = f_loc_ctx()
+[liq_long, liq_short] = f_liq_ctx(bslZones, sslZones)
+
+[w_tr, w_vo, w_lo, w_li, w_sw] = f_ctx_weights()
+
+// Decision confidence: weighted combination with contradiction gate
+// If ANY context < 25 for the direction, apply heavy penalty
+f_gated_score(float raw_score, float min_ctx) =>
+    penalty = min_ctx < 25.0 ? 0.5 : min_ctx < 35.0 ? 0.75 : 1.0
+    raw_score * penalty
+
+raw_long = w_tr * trend_long + w_vo * vol_long + w_lo * loc_long + w_li * liq_long + w_sw * ctx_sweep_long
+raw_short = w_tr * trend_short + w_vo * vol_short + w_lo * loc_short + w_li * liq_short + w_sw * ctx_sweep_short
+min_ctx_long = math.min(trend_long, math.min(vol_long, math.min(loc_long, liq_long)))
+min_ctx_short = math.min(trend_short, math.min(vol_short, math.min(loc_short, liq_short)))
+confidence_long = f_gated_score(raw_long, min_ctx_long)
+confidence_short = f_gated_score(raw_short, min_ctx_short)
+
+// Div hard filter
+if use_div and div_hard_filter and div_type == 1
+    confidence_short := math.min(confidence_short, 15.0)
+if use_div and div_hard_filter and div_type == 2
+    confidence_long := math.min(confidence_long, 15.0)
+
+// ──────────────────────────────────────────────────────
+// 9️⃣ SMART LIQUIDITY PROFILER V10
+// ──────────────────────────────────────────────────────
+
+// ── Asymmetric pivot offsets (right = fast confirmation) ──
+// Extracted to global scope so ta.pivothigh/pivotlow execute every bar (Pine Script consistency requirement)
+liq_local_right  = liq_pivot_right                    // Local: user setting (default 3)
+liq_macro_right  = liq_pivot_right * 2                // Macro: 2x right for structural quality
+liq_micro_right  = math.max(1, liq_pivot_right - 1)   // Micro: fastest, minimal delay
+
+// ── Pivot calls at global scope (must execute every bar for consistent history tracking) ──
+ph_local = ta.pivothigh(high, liq_pivot_local, liq_local_right)
+pl_local = ta.pivotlow(low, liq_pivot_local, liq_local_right)
+ph_macro = ta.pivothigh(high, liq_pivot_macro, liq_macro_right)
+pl_macro = ta.pivotlow(low, liq_pivot_macro, liq_macro_right)
+ph_micro = ta.pivothigh(high, liq_pivot_micro, liq_micro_right)
+pl_micro = ta.pivotlow(low, liq_pivot_micro, liq_micro_right)
+
+if enable_liq_zones and bar_index >= last_visible_bar
+    // ── LOCAL LEVEL (1) ──
+    if not na(ph_local)
+        pIdx = bar_index - liq_local_right
+        pHigh = high[liq_local_right]
+        pBot = math.max(close[liq_local_right], open[liq_local_right])
+        if pHigh - pBot < atr[liq_local_right] * liq_min_height_atr
+            pBot := pHigh - atr[liq_local_right] * liq_min_height_atr
+        f_liq_try_create_zone(bslZones, pIdx, pHigh, pBot, liq_zone_cap, true, 1)
+    if not na(pl_local)
+        pIdxL = bar_index - liq_local_right
+        pLow = low[liq_local_right]
+        pTop = math.min(close[liq_local_right], open[liq_local_right])
+        if pTop - pLow < atr[liq_local_right] * liq_min_height_atr
+            pTop := pLow + atr[liq_local_right] * liq_min_height_atr
+        f_liq_try_create_zone(sslZones, pIdxL, pTop, pLow, liq_zone_cap, false, 1)
+
+    // ── MACRO LEVEL (2) ──
+    if enable_zone_hierarchy and bar_index > liq_pivot_macro + 2
+        if not na(ph_macro)
+            pIdx2 = bar_index - liq_macro_right
+            pHigh2 = high[liq_macro_right]
+            pBot2 = math.max(close[liq_macro_right], open[liq_macro_right])
+            if pHigh2 - pBot2 < atr[liq_macro_right] * liq_min_height_atr
+                pBot2 := pHigh2 - atr[liq_macro_right] * liq_min_height_atr
+            f_liq_try_create_zone(bslZones, pIdx2, pHigh2, pBot2, liq_zone_cap, true, 2)
+        if not na(pl_macro)
+            pIdxL2 = bar_index - liq_macro_right
+            pLow2 = low[liq_macro_right]
+            pTop2 = math.min(close[liq_macro_right], open[liq_macro_right])
+            if pTop2 - pLow2 < atr[liq_macro_right] * liq_min_height_atr
+                pTop2 := pLow2 + atr[liq_macro_right] * liq_min_height_atr
+            f_liq_try_create_zone(sslZones, pIdxL2, pTop2, pLow2, liq_zone_cap, false, 2)
+
+    // ── MICRO LEVEL (0) ──
+    if enable_zone_hierarchy and bar_index > liq_pivot_micro + 2
+        if not na(ph_micro)
+            pIdx0 = bar_index - liq_micro_right
+            pHigh0 = high[liq_micro_right]
+            pBot0 = math.max(close[liq_micro_right], open[liq_micro_right])
+            if pHigh0 - pBot0 < atr[liq_micro_right] * liq_min_height_atr
+                pBot0 := pHigh0 - atr[liq_micro_right] * liq_min_height_atr
+            f_liq_try_create_zone(bslZones, pIdx0, pHigh0, pBot0, liq_zone_cap, true, 0)
+        if not na(pl_micro)
+            pIdxL0 = bar_index - liq_micro_right
+            pLow0 = low[liq_micro_right]
+            pTop0 = math.min(close[liq_micro_right], open[liq_micro_right])
+            if pTop0 - pLow0 < atr[liq_micro_right] * liq_min_height_atr
+                pTop0 := pLow0 + atr[liq_micro_right] * liq_min_height_atr
+            f_liq_try_create_zone(sslZones, pIdxL0, pTop0, pLow0, liq_zone_cap, false, 0)
+
+    // Process all zones
+    if array.size(bslZones) > 0
+        for i = array.size(bslZones) - 1 to 0
+            if i < array.size(bslZones)
+                zB = bslZones.get(i)
+                if not zB.swept
+                    zB.liq_process_bar(true, high, low, barDelta, barVol, totalRange)
+    if array.size(sslZones) > 0
+        for i = array.size(sslZones) - 1 to 0
+            if i < array.size(sslZones)
+                zS = sslZones.get(i)
+                if not zS.swept
+                    zS.liq_process_bar(false, high, low, barDelta, barVol, totalRange)
+
+// ──────────────────────────────────────────────────────
+// 🔟 FVG ENGINE
+// ──────────────────────────────────────────────────────
+var array<linefill> fvg_bull_fills = array.new<linefill>()
+var array<linefill> fvg_bear_fills = array.new<linefill>()
+var array<float>    fvg_bull_tops  = array.new_float()
+var array<float>    fvg_bull_bots  = array.new_float()
+var array<float>    fvg_bear_tops  = array.new_float()
+var array<float>    fvg_bear_bots  = array.new_float()
+var array<label>    fvg_bull_lbls  = array.new<label>()
+var array<label>    fvg_bear_lbls  = array.new<label>()
+var array<linefill> fvg_htf_bull_fills = array.new<linefill>()
+var array<linefill> fvg_htf_bear_fills = array.new<linefill>()
+var array<float>    fvg_htf_bull_tops  = array.new_float()
+var array<float>    fvg_htf_bull_bots  = array.new_float()
+var array<float>    fvg_htf_bear_tops  = array.new_float()
+var array<float>    fvg_htf_bear_bots  = array.new_float()
+var array<label>    fvg_htf_bull_lbls  = array.new<label>()
+var array<label>    fvg_htf_bear_lbls  = array.new<label>()
+
+[fvg_bull_new, fvg_bear_new] = f_fvg_new_flags(atr, norm_fvg_atr_adjust)
+chart_tf_sec = timeframe.in_seconds(timeframe.period)
+htf_tf_sec   = timeframe.in_seconds(fvg_htf_tf)
+fvg_htf_ok   = htf_tf_sec > chart_tf_sec
+fvg_active   = enable_fvg
+fvg_chart_on = fvg_active and show_fvg_chart
+fvg_htf_on   = fvg_active and show_fvg_htf and fvg_htf_ok
+fvg_htf_lbl_txt = "FVG " + f_fmt_tf(fvg_htf_tf)
+
+[htf_evt, htf_gap_top, htf_gap_bot, htf_t_left, htf_t_right] = request.security(syminfo.tickerid, fvg_htf_tf, f_fvg_htf_pulse(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+htf_time_cur = request.security(syminfo.tickerid, fvg_htf_tf, time, gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+htf_bar_new = ta.change(htf_time_cur) != 0
+htf_bull_pulse = fvg_htf_on and htf_bar_new and htf_evt == 1.0 and not na(htf_gap_top) and not na(htf_gap_bot)
+htf_bear_pulse = fvg_htf_on and htf_bar_new and htf_evt == -1.0 and not na(htf_gap_top) and not na(htf_gap_bot)
+min_vis_time = time[math.min(max_history, bar_index)]
+
+if barstate.islast
+    if not fvg_active
+        clear_fvg_zones(fvg_bull_fills, fvg_bull_tops, fvg_bull_bots, fvg_bull_lbls)
+        clear_fvg_zones(fvg_bear_fills, fvg_bear_tops, fvg_bear_bots, fvg_bear_lbls)
+        clear_fvg_zones(fvg_htf_bull_fills, fvg_htf_bull_tops, fvg_htf_bull_bots, fvg_htf_bull_lbls)
+        clear_fvg_zones(fvg_htf_bear_fills, fvg_htf_bear_tops, fvg_htf_bear_bots, fvg_htf_bear_lbls)
+    else
+        if not fvg_chart_on
+            clear_fvg_zones(fvg_bull_fills, fvg_bull_tops, fvg_bull_bots, fvg_bull_lbls)
+            clear_fvg_zones(fvg_bear_fills, fvg_bear_tops, fvg_bear_bots, fvg_bear_lbls)
+        if not fvg_htf_on
+            clear_fvg_zones(fvg_htf_bull_fills, fvg_htf_bull_tops, fvg_htf_bull_bots, fvg_htf_bull_lbls)
+            clear_fvg_zones(fvg_htf_bear_fills, fvg_htf_bear_tops, fvg_htf_bear_bots, fvg_htf_bear_lbls)
+
+if fvg_chart_on and bar_index >= last_visible_bar
+    prune_fvg_left_of(fvg_bull_fills, fvg_bull_tops, fvg_bull_bots, fvg_bull_lbls, last_visible_bar)
+    prune_fvg_left_of(fvg_bear_fills, fvg_bear_tops, fvg_bear_bots, fvg_bear_lbls, last_visible_bar)
+    prune_fvg_filled(fvg_bull_fills, fvg_bull_tops, fvg_bull_bots, fvg_bull_lbls, true, false)
+    prune_fvg_filled(fvg_bear_fills, fvg_bear_tops, fvg_bear_bots, fvg_bear_lbls, false, false)
+    if fvg_bull_new
+        f_fvg_add_zone(fvg_bull_fills, fvg_bull_tops, fvg_bull_bots, fvg_bull_lbls, bar_index[2], bar_index, low, high[2], fvg_bull_bg, fvg_bull_border, false, na, na, "")
+        trim_fvg_zones(fvg_bull_fills, fvg_bull_tops, fvg_bull_bots, fvg_bull_lbls, max_fvg_zones)
+    if fvg_bear_new
+        f_fvg_add_zone(fvg_bear_fills, fvg_bear_tops, fvg_bear_bots, fvg_bear_lbls, bar_index[2], bar_index, low[2], high, fvg_bear_bg, fvg_bear_border, false, na, na, "")
+        trim_fvg_zones(fvg_bear_fills, fvg_bear_tops, fvg_bear_bots, fvg_bear_lbls, max_fvg_zones)
+
+if fvg_htf_on and bar_index >= last_visible_bar
+    prune_fvg_before_time(fvg_htf_bull_fills, fvg_htf_bull_tops, fvg_htf_bull_bots, fvg_htf_bull_lbls, min_vis_time)
+    prune_fvg_before_time(fvg_htf_bear_fills, fvg_htf_bear_tops, fvg_htf_bear_bots, fvg_htf_bear_lbls, min_vis_time)
+    prune_fvg_filled(fvg_htf_bull_fills, fvg_htf_bull_tops, fvg_htf_bull_bots, fvg_htf_bull_lbls, true, true)
+    prune_fvg_filled(fvg_htf_bear_fills, fvg_htf_bear_tops, fvg_htf_bear_bots, fvg_htf_bear_lbls, false, true)
+    if htf_bull_pulse
+        htf_lbl_b = fvg_show_labels ? fvg_htf_lbl_txt : ""
+        f_fvg_add_zone(fvg_htf_bull_fills, fvg_htf_bull_tops, fvg_htf_bull_bots, fvg_htf_bull_lbls, na, na, htf_gap_top, htf_gap_bot, fvg_htf_bull_bg, fvg_htf_bull_border, true, htf_t_left, htf_t_right, htf_lbl_b)
+        trim_fvg_zones(fvg_htf_bull_fills, fvg_htf_bull_tops, fvg_htf_bull_bots, fvg_htf_bull_lbls, max_fvg_htf_zones)
+    if htf_bear_pulse
+        htf_lbl_s = fvg_show_labels ? fvg_htf_lbl_txt : ""
+        f_fvg_add_zone(fvg_htf_bear_fills, fvg_htf_bear_tops, fvg_htf_bear_bots, fvg_htf_bear_lbls, na, na, htf_gap_top, htf_gap_bot, fvg_htf_bear_bg, fvg_htf_bear_border, true, htf_t_left, htf_t_right, htf_lbl_s)
+        trim_fvg_zones(fvg_htf_bear_fills, fvg_htf_bear_tops, fvg_htf_bear_bots, fvg_htf_bear_lbls, max_fvg_htf_zones)
+
+// ──────────────────────────────────────────────────────
+// 1️⃣1️⃣ VSA
+// ──────────────────────────────────────────────────────
+bull1 = close[1] > open[1]
+bear1 = close[1] < open[1]
+bull2 = close[2] > open[2]
+bear2 = close[2] < open[2]
+same_up   = bull1 and bull2
+same_down = bear1 and bear2
+body1 = math.abs(close[1] - open[1])
+body2 = math.abs(close[2] - open[2])
+stopping_vol_bar = bar_index >= 3 and ((same_up or same_down) and volume[1] > volume[2] and body1 < body2)
+no_supply_bar = bar_index >= 3 and ((same_up or same_down) and volume[1] < volume[2] and body1 > body2)
+sv_pat_edge = stopping_vol_bar and not stopping_vol_bar[1]
+ns_pat_edge = no_supply_bar and not no_supply_bar[1]
+
+var array<label> vsa_lbls = array.new<label>()
+if sv_pat_edge and show_stopping_vol and sv_show_label
+    lbSv = label.new(bar_index[1], high[1], "SV", style=label.style_label_down, color=color.new(color.rgb(168, 85, 247), 100), textcolor=color.rgb(168, 85, 247), size=vsa_lbl_sz)
+    array.push(vsa_lbls, lbSv)
+    trim_label_array(vsa_lbls, max_vsa_markers)
+if ns_pat_edge and show_no_supply and ns_show_label
+    lbNs = label.new(bar_index[1], low[1], "NS", style=label.style_label_up, color=color.new(color.rgb(168, 85, 247), 100), textcolor=color.rgb(168, 85, 247), size=vsa_lbl_sz)
+    array.push(vsa_lbls, lbNs)
+    trim_label_array(vsa_lbls, max_vsa_markers)
+
+// ──────────────────────────────────────────────────────
+// 1️⃣2️⃣ PREV SESSION HV
+// ──────────────────────────────────────────────────────
+var float prev_sess_hv_high = na
+var float prev_sess_hv_low  = na
+var float cur_sess_max_vol  = na
+var float cur_sess_hv_high  = na
+var float cur_sess_hv_low   = na
+is_new_session = timeframe.change("D")
+if is_new_session
+    prev_sess_hv_high := cur_sess_hv_high
+    prev_sess_hv_low  := cur_sess_hv_low
+    cur_sess_max_vol  := volume
+    cur_sess_hv_high  := high
+    cur_sess_hv_low   := low
+else
+    if not na(cur_sess_max_vol) and volume > cur_sess_max_vol
+        cur_sess_max_vol := volume
+        cur_sess_hv_high := high
+        cur_sess_hv_low  := low
+
+hv_style = hv_line_style == "Circles" ? plot.style_circles : (hv_line_style == "Steps" ? plot.style_stepline : plot.style_line)
+plot(show_hv_levels ? prev_sess_hv_high : na, color=color.new(C_VOL_LEVEL, 0), linewidth=hv_line_width, style=hv_style, title="Prev HV High")
+plot(show_hv_levels ? prev_sess_hv_low  : na, color=color.new(C_VOL_LEVEL, 0), linewidth=hv_line_width, style=hv_style, title="Prev HV Low")
+
+// ──────────────────────────────────────────────────────
+// 1️⃣3️⃣ SWEEP ENGINE V10 + PHASE 2
+// ──────────────────────────────────────────────────────
+sweep_20_high = ta.highest(high, sweep_length)[2]
+sweep_20_low  = ta.lowest(low,  sweep_length)[2]
+sweep_vol_sma = ta.sma(volume, sweep_length)
+sweep_plot_style = sweep_line_style == "Circles" ? plot.style_circles : (sweep_line_style == "Steps" ? plot.style_stepline : plot.style_line)
+
+var bool  sv_isActive   = false
+var int   sv_direction  = 0
+var float sv_level      = na
+var float sv_extremum   = na
+var int   sv_startBar   = 0
+var float sv_confidence = 0.0
+var int   sv_cooldown   = 0
+var int   sv_barsWaiting = 0
+bool sweep_buy_signal  = false
+bool sweep_sell_signal = false
+
+// V10: Sweep quality components
+var float sv_depth_score = 0.0
+var float sv_speed_score = 0.0
+var float sv_volume_score = 0.0
+var float sv_rejection_score = 0.0
+// Phase 2: Enhanced quality components
+var float sv_wick_score = 0.0
+var float sv_close_position_score = 0.0
+
+if sv_cooldown > 0
+    sv_cooldown -= 1
+
+if not sv_isActive and sv_cooldown <= 0 and bar_index > sweep_length + 2
+    if low[1] < sweep_20_low and volume[1] > sweep_vol_sma[1] * norm_sweep_vol_adjust
+        sv_isActive   := true
+        sv_direction  := 1
+        sv_level      := sweep_20_low
+        sv_extremum   := low[1]
+        sv_startBar   := bar_index
+        sv_barsWaiting := 0
+        // Depth: how far below the level
+        depth = (sweep_20_low - low[1]) / atr
+        sv_depth_score := math.min(100, depth * 50.0)
+        sv_volume_score := math.min(100, (volume[1] / sweep_vol_sma[1]) * 30.0)
+    else if high[1] > sweep_20_high and volume[1] > sweep_vol_sma[1] * norm_sweep_vol_adjust
+        sv_isActive   := true
+        sv_direction  := -1
+        sv_level      := sweep_20_high
+        sv_extremum   := high[1]
+        sv_startBar   := bar_index
+        sv_barsWaiting := 0
+        depth = (high[1] - sweep_20_high) / atr
+        sv_depth_score := math.min(100, depth * 50.0)
+        sv_volume_score := math.min(100, (volume[1] / sweep_vol_sma[1]) * 30.0)
+
+if sv_isActive
+    sv_barsWaiting += 1
+    if sv_direction == 1 and low < sv_extremum
+        sv_extremum := low
+    if sv_direction == -1 and high > sv_extremum
+        sv_extremum := high
+    barsElapsed = sv_barsWaiting
+    if sv_direction == 1
+        if close > sv_level and barsElapsed <= sweep_timeout
+            sv_confidence := math.max(0.3, 1.0 - (barsElapsed - 1) * 0.2)
+            sweep_buy_signal := true
+            sv_speed_score := barsElapsed == 1 ? 100.0 : barsElapsed == 2 ? 80.0 : barsElapsed == 3 ? 60.0 : 40.0
+            body_reclaim = (close - open) / atr
+            sv_rejection_score := math.min(100, body_reclaim * 60.0)
+            // Phase 2: Wick score for longs — lower wick / range (bigger wick = rejection of lows)
+            bar_rng = high - low
+            lower_wick = math.min(open, close) - low
+            sv_wick_score := bar_rng > 0 ? math.min(100, (lower_wick / bar_rng) * 100) : 0.0
+            // Phase 2: Close position for longs — close above midpoint = stronger reclaim
+            sv_close_position_score := bar_rng > 0 ? math.min(100, ((close - low) / bar_rng) * 100) : 50.0
+            sv_isActive := false
+            sv_cooldown := sweep_cooldown
+        else if barsElapsed > sweep_timeout
+            sv_isActive := false
+            sv_cooldown := sweep_cooldown
+    else if sv_direction == -1
+        if close < sv_level and barsElapsed <= sweep_timeout
+            sv_confidence := math.max(0.3, 1.0 - (barsElapsed - 1) * 0.2)
+            sweep_sell_signal := true
+            sv_speed_score := barsElapsed == 1 ? 100.0 : barsElapsed == 2 ? 80.0 : barsElapsed == 3 ? 60.0 : 40.0
+            body_reclaim = (open - close) / atr
+            sv_rejection_score := math.min(100, body_reclaim * 60.0)
+            // Phase 2: Wick score for shorts — upper wick / range (bigger wick = rejection of highs)
+            bar_rng = high - low
+            upper_wick = high - math.max(open, close)
+            sv_wick_score := bar_rng > 0 ? math.min(100, (upper_wick / bar_rng) * 100) : 0.0
+            // Phase 2: Close position for shorts — close below midpoint = stronger reclaim
+            sv_close_position_score := bar_rng > 0 ? math.min(100, ((high - close) / bar_rng) * 100) : 50.0
+            sv_isActive := false
+            sv_cooldown := sweep_cooldown
+        else if barsElapsed > sweep_timeout
+            sv_isActive := false
+            sv_cooldown := sweep_cooldown
+
+// V10 + Phase 2: Sweep Quality Score (0-100) — enhanced with wick + close position
+sweep_quality = (sv_depth_score * 0.20 + sv_speed_score * 0.25 + sv_volume_score * 0.15 + sv_rejection_score * 0.20 + sv_wick_score * 0.10 + sv_close_position_score * 0.10)
+sweep_quality := (sweep_buy_signal or sweep_sell_signal) ? sweep_quality : 0.0
+
+// ──────────────────────────────────────────────────────
+// PHASE 2: FALSE SWEEP DETECTION
+// ──────────────────────────────────────────────────────
+var float avg_sweep_vol = float(na)
+var int sweep_count = 0
+var bool is_false_sweep = false
+
+// Track sweep volume for running average
+if sweep_buy_signal or sweep_sell_signal
+    sweep_vol = nz(volume[1])
+    if sweep_count == 0
+        avg_sweep_vol := sweep_vol
+    else
+        avg_sweep_vol := (avg_sweep_vol * sweep_count + sweep_vol) / (sweep_count + 1)
+    sweep_count += 1
+
+// False sweep detection (instant, no retrospective — only on signal bar)
+is_false_sweep := false
+if enable_false_sweep and (sweep_buy_signal or sweep_sell_signal)
+    sweep_body = math.abs(close - open)
+    sweep_range = high - low
+    depth_val = sv_direction == 1 ? (sv_level - sv_extremum) : (sv_extremum - sv_level)
+    // Criteria (4 instant checks, no future bars needed):
+    // 1. Shallow penetration: depth < false_sweep_min_depth * ATR
+    shallow = math.abs(depth_val) < false_sweep_min_depth * atr
+    // 2. Low volume: sweep volume < false_sweep_vol_ratio * average sweep volume
+    low_vol = not na(avg_sweep_vol) and nz(volume[1]) < avg_sweep_vol * false_sweep_vol_ratio
+    // 3. Large body: body/range > false_sweep_body_ratio (momentum, not rejection)
+    large_body = sweep_range > 0 and (sweep_body / sweep_range) > false_sweep_body_ratio
+    // 4. RSI not in extreme zone (no oversold/overbought = no rejection pressure)
+    rsi_no_extreme = false_sweep_rsi_extreme and (sv_direction == 1 ? rsi > 30 : rsi < 70)
+    // Flag as false if 2+ criteria met
+    false_count = (shallow ? 1 : 0) + (low_vol ? 1 : 0) + (large_body ? 1 : 0) + (rsi_no_extreme ? 1 : 0)
+    is_false_sweep := false_count >= 2
+
+// ──────────────────────────────────────────────────────
+// 1️⃣4️⃣ FVG–SWEEP CONFLUENCE  ← V10 NEW
+// ──────────────────────────────────────────────────────
+// Check if there's an unfilled FVG in the direction of the sweep reclaim
+f_has_fvg_near(float price, bool is_bull, float threshold_atr) =>
+    found = false
+    if is_bull
+        if array.size(fvg_bull_tops) > 0
+            for j = 0 to array.size(fvg_bull_tops) - 1
+                fvg_t = array.get(fvg_bull_tops, j)
+                fvg_b = array.get(fvg_bull_bots, j)
+                if price >= fvg_b and price <= fvg_t + atr * threshold_atr
+                    found := true
+                    break
+    else
+        if array.size(fvg_bear_tops) > 0
+            for j = 0 to array.size(fvg_bear_tops) - 1
+                fvg_t = array.get(fvg_bear_tops, j)
+                fvg_b = array.get(fvg_bear_bots, j)
+                if price <= fvg_t and price >= fvg_b - atr * threshold_atr
+                    found := true
+                    break
+    found
+
+// Check if a liquidity zone was just swept in the direction
+f_liq_swept_near(bool is_bull) =>
+    found = false
+    if is_bull
+        if array.size(sslZones) > 0
+            for z in sslZones
+                if z.swept and bar_index - z.right < 5
+                    found := true
+                    break
+    else
+        if array.size(bslZones) > 0
+            for z in bslZones
+                if z.swept and bar_index - z.right < 5
+                    found := true
+                    break
+    found
+
+bool fvg_confluence_long  = false
+bool fvg_confluence_short = false
+bool liq_confluence_long  = false
+bool liq_confluence_short = false
+
+if sweep_buy_signal
+    fvg_confluence_long  := f_has_fvg_near(close, true, 2.0)
+    liq_confluence_long  := f_liq_swept_near(true)
+if sweep_sell_signal
+    fvg_confluence_short := f_has_fvg_near(close, false, 2.0)
+    liq_confluence_short := f_liq_swept_near(false)
+
+// ──────────────────────────────────────────────────────
+// 1️⃣5️⃣ SIGNAL GRADING  ← V10 NEW
+// ──────────────────────────────────────────────────────
+// Update sweep context dynamically
+if sweep_buy_signal
+    ctx_sweep_long := 50.0 + sv_confidence * 40.0 + sweep_quality * 0.1
+    ctx_sweep_short := 30.0
+else if sweep_sell_signal
+    ctx_sweep_short := 50.0 + sv_confidence * 40.0 + sweep_quality * 0.1
+    ctx_sweep_long := 30.0
+else
+    ctx_sweep_long := 50.0
+    ctx_sweep_short := 50.0
+
+// Basic filter gates (Phase 2: use norm_min_atr_adjust)
+atr_ok = atr > atr_sma20 * norm_min_atr_adjust
+sweep_mtf_long_ok  = not sweep_use_mtf  or mtf_trend == 0 or mtf_trend == 1
+sweep_mtf_short_ok = not sweep_use_mtf  or mtf_trend == 0 or mtf_trend == -1
+sweep_trend_long_ok  = not sweep_use_trend or trend_direction == 1
+sweep_trend_short_ok = not sweep_use_trend or trend_direction == -1
+sweep_session_ok = not sweep_use_session or in_session
+div_gate_long_ok  = not use_div or not div_hard_filter or div_type != 1
+div_gate_short_ok = not use_div or not div_hard_filter or div_type != 2
+only_trend_long_ok  = not only_trend or trend_direction == 1
+only_trend_short_ok = not only_trend or trend_direction == -1
+
+// Raw sweep signals (pass basic gates)
+raw_buy  = sweep_buy_signal  and atr_ok and sweep_mtf_long_ok  and sweep_trend_long_ok  and sweep_session_ok and div_gate_long_ok  and only_trend_long_ok
+raw_sell = sweep_sell_signal and atr_ok and sweep_mtf_short_ok and sweep_trend_short_ok and sweep_session_ok and div_gate_short_ok and only_trend_short_ok
+
+// Apply context engine filter
+ctx_buy_ok  = not sweep_use_ai  or confidence_long  >= grade_c_thresh
+ctx_sell_ok = not sweep_use_ai  or confidence_short >= grade_c_thresh
+
+buy_signal  = raw_buy  and ctx_buy_ok
+sell_signal = raw_sell and ctx_sell_ok
+
+// ── GRADE ASSIGNMENT ──
+// A+: confidence >= threshold, FVG confluence, liquidity confluence
+// A:  confidence >= threshold, liquidity confluence
+// B:  confidence >= threshold
+// C:  confidence >= C threshold but below B
+// Filtered: fails context or hard gates
+
+f_signal_grade(bool is_long) =>
+    conf = is_long ? confidence_long : confidence_short
+    has_fvg = is_long ? fvg_confluence_long : fvg_confluence_short
+    has_liq = is_long ? liq_confluence_long : liq_confluence_short
+    ap_ok = conf >= grade_ap_thresh and (not require_fvg_confluence or has_fvg) and (not require_liq_confluence or has_liq)
+    a_ok = conf >= grade_a_thresh and (not require_liq_confluence or has_liq)
+    b_ok = conf >= grade_b_thresh
+    c_ok = conf >= grade_c_thresh
+    raw_grade = ap_ok ? 4 : a_ok ? 3 : b_ok ? 2 : c_ok ? 1 : 0
+    // Phase 2: False sweep penalty — downgrade by 1 level
+    is_false = is_long ? (sweep_buy_signal and is_false_sweep) : (sweep_sell_signal and is_false_sweep)
+    adjusted = is_false and raw_grade > 0 ? raw_grade - 1 : raw_grade
+    adjusted
+
+buy_grade  = buy_signal  ? f_signal_grade(true)  : 0
+sell_grade = sell_signal ? f_signal_grade(false) : 0
+
+f_grade_str(int g) =>
+    g == 4 ? "A+" : g == 3 ? "A" : g == 2 ? "B" : g == 1 ? "C" : "X"
+
+f_grade_color(int g) =>
+    g == 4 ? C_GRADE_AP : g == 3 ? C_GRADE_A : g == 2 ? C_GRADE_B : g == 1 ? C_GRADE_C : C_SHORT
+
+f_grade_text(bool is_long, int g) =>
+    (is_long ? "LONG " : "SHORT ") + f_grade_str(g)
+
+// ──────────────────────────────────────────────────────
+// 1️⃣6️⃣ VISUALIZATION
+// ──────────────────────────────────────────────────────
+plot(bar_index >= last_visible_bar ? vwap_val : na, color=C_VWAP, linewidth=2, title="VWAP")
+plot(show_sweep_levels ? sweep_20_high : na, color=color.new(C_SWEEP_LVL, 40), linewidth=2, style=sweep_plot_style, title="Sweep High")
+plot(show_sweep_levels ? sweep_20_low  : na, color=color.new(C_SWEEP_LVL, 40), linewidth=2, style=sweep_plot_style, title="Sweep Low")
+
+var box sweep_zone_box = na
+if sv_isActive and show_sweep_zones and bar_index >= last_visible_bar
+    if not na(sweep_zone_box)
+        box.delete(sweep_zone_box)
+    zone_top = sv_direction == 1 ? sv_level : sv_extremum
+    zone_bot = sv_direction == 1 ? sv_extremum : sv_level
+    zone_color = sv_direction == 1 ? color.new(C_LONG, 80) : color.new(C_SHORT, 80)
+    border_col = sv_direction == 1 ? color.new(C_LONG, 40) : color.new(C_SHORT, 40)
+    sweep_zone_box := box.new(sv_startBar, zone_top, bar_index, zone_bot, bgcolor=zone_color, border_color=border_col, border_width=1)
+if not sv_isActive and not na(sweep_zone_box)
+    box.delete(sweep_zone_box)
+    sweep_zone_box := na
+
+// Signal shapes with grade labels (label.new for dynamic text)
+if buy_signal and buy_grade >= 3 and bar_index >= last_visible_bar
+    label.new(bar_index, low, f_grade_text(true, buy_grade), style=label.style_label_up, color=f_grade_color(buy_grade), textcolor=color.white, size=size.normal)
+if buy_signal and buy_grade == 2 and bar_index >= last_visible_bar
+    label.new(bar_index, low, f_grade_text(true, buy_grade), style=label.style_label_up, color=f_grade_color(buy_grade), textcolor=color.white, size=size.small)
+plotshape(buy_signal  and buy_grade == 1 and bar_index >= last_visible_bar, title="BUY C",      location=location.belowbar, style=shape.circle,  size=size.tiny,   color=f_grade_color(buy_grade))
+if sell_signal and sell_grade >= 3 and bar_index >= last_visible_bar
+    label.new(bar_index, high, f_grade_text(false, sell_grade), style=label.style_label_down, color=f_grade_color(sell_grade), textcolor=color.white, size=size.normal)
+if sell_signal and sell_grade == 2 and bar_index >= last_visible_bar
+    label.new(bar_index, high, f_grade_text(false, sell_grade), style=label.style_label_down, color=f_grade_color(sell_grade), textcolor=color.white, size=size.small)
+plotshape(sell_signal and sell_grade == 1 and bar_index >= last_visible_bar, title="SELL C",     location=location.abovebar, style=shape.circle,  size=size.tiny,   color=f_grade_color(sell_grade))
+// Raw sweeps (filtered by context)
+plotshape(sweep_buy_signal  and not buy_signal  and bar_index >= last_visible_bar, title="Raw Sweep Long",  location=location.belowbar, style=shape.circle, size=size.tiny, color=color.new(C_LONG, 70))
+plotshape(sweep_sell_signal and not sell_signal and bar_index >= last_visible_bar, title="Raw Sweep Short", location=location.abovebar, style=shape.circle, size=size.tiny, color=color.new(C_SHORT, 70))
+// Phase 2: False sweep marker (orange X)
+plotshape(buy_signal and is_false_sweep and bar_index >= last_visible_bar, title="False Sweep Long",  location=location.belowbar, style=shape.xcross, size=size.small, color=C_FALSE_SWEEP)
+plotshape(sell_signal and is_false_sweep and bar_index >= last_visible_bar, title="False Sweep Short", location=location.abovebar, style=shape.xcross, size=size.small, color=C_FALSE_SWEEP)
+
+// Hidden plots for alerts/scanning
+plot(confidence_long,  title="ConfLong",       display=display.none)
+plot(confidence_short, title="ConfShort",      display=display.none)
+plot(sweep_quality,    title="SweepQuality",   display=display.none)
+plot(buy_grade,        title="BuyGrade",       display=display.none)
+plot(sell_grade,       title="SellGrade",      display=display.none)
+
+// Alerts
+alertcondition(buy_signal  and buy_grade >= 3, title="BUY A+/A",  message="Smart Flow v10: LONG A+/A | Confidence: {{plot_0}}")
+alertcondition(buy_signal  and buy_grade == 2, title="BUY B",     message="Smart Flow v10: LONG B | Confidence: {{plot_0}}")
+alertcondition(sell_signal and sell_grade >= 3, title="SELL A+/A", message="Smart Flow v10: SHORT A+/A | Confidence: {{plot_1}}")
+alertcondition(sell_signal and sell_grade == 2, title="SELL B",    message="Smart Flow v10: SHORT B | Confidence: {{plot_1}}")
+
+// ──────────────────────────────────────────────────────
+// 1️⃣7️⃣ DASHBOARD V10 + PHASE 2
+// ──────────────────────────────────────────────────────
+var table dash = table.new(position.top_right, 2, 21, bgcolor=C_PANEL, border_width=1, border_color=color.new(color.white, 90))
+if barstate.islast
+    table.cell(dash, 0, 0, "SMART FLOW V10", text_color=C_TEXT_MAIN, bgcolor=color.new(color.black, 50))
+    table.cell(dash, 1, 0, "PHASE 2", text_color=C_GRADE_AP, bgcolor=color.new(color.black, 50))
+    table.cell(dash, 0, 1, "REGIME", text_color=C_TEXT_DIM)
+    regime_str = market_regime == 0 ? "ULTRA LOW" : market_regime == 1 ? "LOW" : market_regime == 2 ? "NORMAL" : "HIGH"
+    table.cell(dash, 1, 1, regime_str, text_color=market_regime >= 2 ? C_LONG : C_SHORT)
+    table.cell(dash, 0, 2, "MTF TREND (" + mtf_tf + ")", text_color=C_TEXT_DIM)
+    table.cell(dash, 1, 2, mtf_trend == 1 ? "BULLISH" : mtf_trend == -1 ? "BEARISH" : "OFF", text_color=mtf_trend == 1 ? C_LONG : mtf_trend == -1 ? C_SHORT : C_TEXT_DIM)
+    table.cell(dash, 0, 3, "LOCAL TREND", text_color=C_TEXT_DIM)
+    table.cell(dash, 1, 3, trend_direction == 1 ? "BULLISH" : "BEARISH", text_color=trend_direction == 1 ? C_LONG : C_SHORT)
+    table.cell(dash, 0, 4, "CONFIDENCE L/S", text_color=C_TEXT_DIM)
+    table.cell(dash, 1, 4, str.tostring(confidence_long, "#.0") + "% / " + str.tostring(confidence_short, "#.0") + "%", text_color=C_TEXT_MAIN)
+    table.cell(dash, 0, 5, "SWEEP STATE", text_color=C_TEXT_DIM)
+    sweep_state_str = sv_isActive ? (sv_direction == 1 ? "SEEK LONG" : "SEEK SHORT") : sv_cooldown > 0 ? "COOLDOWN" : "SCANNING"
+    table.cell(dash, 1, 5, sweep_state_str, text_color=C_SWEEP_LVL)
+    table.cell(dash, 0, 6, "SIGNAL", text_color=C_TEXT_DIM)
+    sig_str = buy_signal ? f_grade_text(true, buy_grade) : sell_signal ? f_grade_text(false, sell_grade) : "WAIT"
+    sig_col = buy_signal ? f_grade_color(buy_grade) : sell_signal ? f_grade_color(sell_grade) : C_TEXT_DIM
+    table.cell(dash, 1, 6, sig_str, text_color=sig_col)
+    bslAct = f_liq_count_active_fn(bslZones)
+    sslAct = f_liq_count_active_fn(sslZones)
+    bslH = f_liq_min_health_fn(bslZones)
+    sslH = f_liq_min_health_fn(sslZones)
+    table.cell(dash, 0, 7, "LIQ ZONES", text_color=C_TEXT_DIM)
+    table.cell(dash, 1, 7, "BSL " + str.tostring(bslAct) + " / SSL " + str.tostring(sslAct), text_color=C_TEXT_MAIN)
+    table.cell(dash, 0, 8, "ZONE HEALTH", text_color=C_TEXT_DIM)
+    hStr = enable_liq_zones ? (not na(bslH) ? "BSL " + str.tostring(int(bslH)) + "%" : "BSL --") + " / " + (not na(sslH) ? "SSL " + str.tostring(int(sslH)) + "%" : "SSL --") : "OFF"
+    table.cell(dash, 1, 8, hStr, text_color=C_VOL_LEVEL)
+    table.cell(dash, 0, 9, "FVG (" + fvg_strength_preset + ")", text_color=C_TEXT_DIM)
+    fvg_dash = enable_fvg ? str.tostring(array.size(fvg_bull_fills)) + "↑/" + str.tostring(array.size(fvg_bear_fills)) + "↓" : "OFF"
+    if enable_fvg and show_fvg_htf and fvg_htf_ok
+        fvg_dash += " HTF " + str.tostring(array.size(fvg_htf_bull_fills)) + "↑/" + str.tostring(array.size(fvg_htf_bear_fills)) + "↓"
+    table.cell(dash, 1, 9, fvg_dash, text_color=C_TEXT_DIM)
+    table.cell(dash, 0, 10, "SWEEP QUALITY", text_color=C_TEXT_DIM)
+    table.cell(dash, 1, 10, (sweep_buy_signal or sweep_sell_signal) ? str.tostring(sweep_quality, "#.0") : "--", text_color=C_SWEEP_LVL)
+    table.cell(dash, 0, 11, "FVG CONFLUENCE", text_color=C_TEXT_DIM)
+    conf_str = buy_signal ? (fvg_confluence_long ? "YES" : "NO") : sell_signal ? (fvg_confluence_short ? "YES" : "NO") : "--"
+    table.cell(dash, 1, 11, conf_str, text_color=conf_str == "YES" ? C_GRADE_AP : C_TEXT_DIM)
+    table.cell(dash, 0, 12, "LIQ CONFLUENCE", text_color=C_TEXT_DIM)
+    liq_conf_str = buy_signal ? (liq_confluence_long ? "YES" : "NO") : sell_signal ? (liq_confluence_short ? "YES" : "NO") : "--"
+    table.cell(dash, 1, 12, liq_conf_str, text_color=liq_conf_str == "YES" ? C_GRADE_AP : C_TEXT_DIM)
+    table.cell(dash, 0, 13, "CONTEXT TREND", text_color=C_TEXT_DIM)
+    table.cell(dash, 1, 13, str.tostring(trend_long, "#.0") + " / " + str.tostring(trend_short, "#.0"), text_color=C_TEXT_DIM)
+    table.cell(dash, 0, 14, "CONTEXT VOL", text_color=C_TEXT_DIM)
+    table.cell(dash, 1, 14, str.tostring(vol_long, "#.0") + " / " + str.tostring(vol_short, "#.0"), text_color=C_TEXT_DIM)
+    table.cell(dash, 0, 15, "CONTEXT LOC", text_color=C_TEXT_DIM)
+    table.cell(dash, 1, 15, str.tostring(loc_long, "#.0") + " / " + str.tostring(loc_short, "#.0"), text_color=C_TEXT_DIM)
+    table.cell(dash, 0, 16, "CONTEXT LIQ", text_color=C_TEXT_DIM)
+    table.cell(dash, 1, 16, str.tostring(liq_long, "#.0") + " / " + str.tostring(liq_short, "#.0"), text_color=C_TEXT_DIM)
+    table.cell(dash, 0, 17, "DIV / TREND", text_color=C_TEXT_DIM)
+    table.cell(dash, 1, 17, (div_type == 1 ? "BEAR DIV" : div_type == 2 ? "BULL DIV" : "NONE") + " / OT " + (only_trend ? "ON" : "OFF"), text_color=C_TEXT_DIM)
+    // Phase 2: Dashboard rows
+    table.cell(dash, 0, 18, "NORM REGIME", text_color=C_TEXT_DIM)
+    norm_regime_str = not enable_normalization ? "OFF" : norm_atr_percentile < 30 ? "LOW VOL" : norm_atr_percentile > 70 ? "HIGH VOL" : "NORMAL"
+    norm_regime_col = not enable_normalization ? C_TEXT_DIM : norm_atr_percentile < 30 ? C_SHORT : norm_atr_percentile > 70 ? C_LONG : C_TEXT_MAIN
+    table.cell(dash, 1, 18, norm_regime_str + " " + (enable_normalization ? str.tostring(norm_atr_percentile, "#.0") + "%" : ""), text_color=norm_regime_col)
+    table.cell(dash, 0, 19, "SWEEP QLTY V2", text_color=C_TEXT_DIM)
+    sq_detail = (sweep_buy_signal or sweep_sell_signal) ? "D:" + str.tostring(sv_depth_score, "#.0") + " S:" + str.tostring(sv_speed_score, "#.0") + " V:" + str.tostring(sv_volume_score, "#.0") + " W:" + str.tostring(sv_wick_score, "#.0") : "--"
+    table.cell(dash, 1, 19, sq_detail, text_color=C_SWEEP_LVL)
+    table.cell(dash, 0, 20, "FALSE SWEEP", text_color=C_TEXT_DIM)
+    fs_str = not enable_false_sweep ? "OFF" : (buy_signal or sell_signal) and is_false_sweep ? "FLAGGED" : "CLEAR"
+    fs_col = not enable_false_sweep ? C_TEXT_DIM : fs_str == "FLAGGED" ? C_FALSE_SWEEP : C_LONG
+    table.cell(dash, 1, 20, fs_str, text_color=fs_col)
